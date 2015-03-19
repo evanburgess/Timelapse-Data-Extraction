@@ -96,11 +96,8 @@ def import_raster(filepath,dtmparse = '(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2
     datetxt = N.array(re.findall(dtmparse,filename)[0]).astype(int)
     date = dtm.datetime(datetxt[0],datetxt[1],datetxt[2],datetxt[3],datetxt[4],datetxt[5])
     
-    # Connect to an existing spatially enabled database
-    conn, cur = ConnectDb()
-    
-    cur.execute("SELECT photoid FROM timelapse WHERE path='%s';" % filepath)
-    if len(cur.fetchall())!=0:
+    # CHECKING IF FILE HAS BEEN IMPORTED ALREADY 
+    if len(querydb("SELECT photoid FROM timelapse WHERE path='%s';" % filepath,aslist=False))!=0:
         print "WARNING: This image has already been imported, import canceled"
         return None
     
@@ -109,17 +106,15 @@ def import_raster(filepath,dtmparse = '(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2
     
     #FINDING ID OF LAST ENTRY IN TABLE
     cur.execute("SELECT photoid::int from timelapse order by photoid desc limit 1;")
-    photoid = cur.fetchall()[0][0]
+    photoid = querydb("SELECT photoid::int from timelapse order by photoid desc limit 1;")
     
     #UPDATING OTHER IMAGE METADATA
-    cur.execute("UPDATE timelapse SET (cameraid,locationid,date,path) = (%i,%i,'%s','%s') WHERE photoid=%i;" % (cameraid,locationid,re.sub('T',' ', date.isoformat()),filepath,photoid))
-    conn.commit()
+    alterdb("UPDATE timelapse SET (cameraid,locationid,date,path) = (%i,%i,'%s','%s') WHERE photoid=%i;" % (cameraid,locationid,re.sub('T',' ', date.isoformat()),filepath,photoid))
+
     
     #FINDING ID OF THIS IMAGE
-    cur.execute("SELECT photoid::int from timelapse order by photoid desc limit 1;")
+    out = querydb(("SELECT photoid::int from timelapse order by photoid desc limit 1;")
     
-    out = cur.fetchall()[0][0]
-    cur.close()
     return out
     
 
