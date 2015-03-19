@@ -253,8 +253,8 @@ class TimeImage:
             toggle = False
             
         #start_time = time.time()
-        #conn = psycopg2.connect(database = 'altimetry', host='localhost')
-        #cur = conn.cursor()
+        conn = psycopg2.connect(database = 'altimetry', host='localhost')
+        cur = conn.cursor()
         
         if type(getfields)==NoneType:fields = 'geometry'
         else: 
@@ -266,16 +266,16 @@ class TimeImage:
   
         #QUERYING DATABASE
         #print "SELECT %s FROM edges %s;" % (fields,where)
-        #cur.execute("SELECT %s FROM edges %s;" % (fields,where))
-        out,fields = querydb("SELECT %s FROM edges %s;" % (fields,where),returnfields=True)
+        cur.execute("SELECT %s FROM edges %s;" % (fields,where))
+        #out,fields = querydb("SELECT %s FROM edges %s;" % (fields,where),returnfields=True)
         #getting fields 
-        #fields = [column[0] for column in cur.description]
+        fields = [column[0] for column in cur.description]
         
         #print fields
         
         #this takes the database output puts it in columns then into a dictionary with field names as keys
-        #out = dict(zip(fields,zip(*cur.fetchall())))
-        #cur.close()
+        out = dict(zip(fields,zip(*cur.fetchall())))
+        cur.close()
         
 
         out['lines'] = [ppygis.Geometry.read_ewkb(row) for row in out['geometry']]
@@ -451,6 +451,146 @@ class Edges:
 def ppy2xy(inpt, inverty=False):
     if inverty:return [N.array([[pt.x,-pt.y] for pt in ls.points]) for ls in inpt]
     else:return [N.array([[pt.x,pt.y] for pt in ls.points]) for ls in inpt]
+    
+def geom_converter(geom, to_ppy=False, to_xy=False,to_bin=False,negy=True,verbose=True):
+    if sum([to_ppy,to_xy,to_bin])!=1:raise "ERROR: please select one output format"
+    
+    #print re.search('|S',geom[2].dtype)
+    
+    #TESTING TO SEE IF INPUT GEOMETRY IS BINARY
+    try:
+        if geom[0].dtype.char == 'S':  #  INPUT IS A BINARY GEOMETRY
+            print 'binary'
+            
+            if to_bin:
+                if verbose: print 'Input unchanged'
+                return geom
+            
+            ppy=[ppygis.Geometry.read_ewkb(row) for row in geom] 
+            
+            if to_ppy:
+                if verbose: print 'Converting binary to ppy.Linestring'
+                return ppy
+                
+            if to_xy:
+                if negy:
+                    if ppy[0].points[0].y<0:
+                        if verbose: print 'Converting binary to xy. Leaving ys negative.'
+                        return [N.array([[pt.x,pt.y] for pt in ls.points]) for ls in ppy]
+                    else:
+                        if verbose: print 'Converting binary to xy. Reversing ys to negative.'
+                        return [N.array([[pt.x,-pt.y] for pt in ls.points]) for ls in ppy] 
+                else:
+                    if ppy[0].points[0].y<0:
+                        if verbose: print 'Converting binary to xy. Reversing ys to positive.'
+                        return [N.array([[pt.x,-pt.y] for pt in ls.points]) for ls in ppy]
+                    else:
+                        if verbose: print 'Converting binary to xy. Leaving ys positive.'
+                        return [N.array([[pt.x,pt.y] for pt in ls.points]) for ls in ppy] 
+          
+    except:pass
+    
+        #TESTING TO SEE IF INPUT GEOMETRY IS PPYGIS.LINESTRING
+
+    if type(geom[0])==ppygis.LineString:  #  INPUT IS A ppygis GEOMETRY
+            print 'ppygis'
+            
+            if to_ppy:
+                if verbose: print 'Input unchanged'
+                return geom
+
+            if to_bin:
+                #MAKING SURE BINARY VERSION HAS NEGATIVE Y VALUES
+                if geom[0].points[0].y>0:
+                    for g in geom:
+                        for p in g.points:
+                            p.y=-p.y  #THIS MIGHT BE A TIME HOG!!!!
+                    if verbose: print 'Converting ppy.Linestring to binary. Reversing xys to negative.'
+                else:
+                    if verbose: print 'Converting ppy.Linestring to binary. Leaving xys negative.'
+                return N.array([ppygis.Geometry.write_ewkb(row) for row in geom])
+
+            if to_xy:
+                if negy:
+                    if geom[0].points[0].y<0:
+                        if verbose: print 'Converting ppy.Linestring to xy. Leaving ys negative.'
+                        return [N.array([[pt.x,pt.y] for pt in ls.points]) for ls in geom]
+                    else:
+                        if verbose: print 'Converting ppy.Linestring to xy. Reversing ys to negative.'
+                        return [N.array([[pt.x,-pt.y] for pt in ls.points]) for ls in geom] 
+                else:
+                    if geom[0].points[0].y<0:
+                        if verbose: print 'Converting ppy.Linestring to xy. Reversing ys to positive.'
+                        return [N.array([[pt.x,-pt.y] for pt in ls.points]) for ls in geom]
+                    else:
+                        if verbose: print 'Converting ppy.Linestring to xy. Leaving ys positive.'
+                        return [N.array([[pt.x,pt.y] for pt in ls.points]) for ls in geom] 
+                        
+    #TESTING TO SEE IF INPUT GEOMETRY IS XY                     
+    if geom[0][0][0].dtype==float:  #  INPUT IS A xy GEOMETRY
+        
+        if geom[0][0,1]<0:
+            nowneg = True
+        else:
+            nowneg = False
+            
+        if to_xy:
+
+            if negy == nowneg:
+                if verbose: print 'Input Unchanged'
+                return geom
+            if negy != nowneg:
+
+                if verbose and negy: print 'Returning xy. Converting ys to positive.'
+                if verbose and not negy: print 'Returning xy. Converting ys to negative.'
+                
+                out = geom[:]
+                for g in out:g[:,1]=-g[:,1]
+                return out
+                
+        if to_ppy:
+                
+            if negy == nowneg:
+                if verbose and negy: print 'Converting xy to ppy.Linestring. Leaving ys negative.'
+                if verbose and not negy: print 'Returning ppy.Linestring. Leaving ys positive.'
+                ppy=[ppygis.LineString([ppygis.Point(o[0][0],o[0][1]) for o in c]) for c in geom]
+            if negy != nowneg: 
+                if verbose and negy: print 'Converting xy to ppy.Linestring. Converting ys to negative.'
+                if verbose and not negy: print 'Returning ppy.Linestring. Converting ys to positive.'                
+                ppy=[ppygis.LineString([ppygis.Point(o[0][0],-o[0][1]) for o in c]) for c in geom]
+                
+            return ppy
+            
+           
+        if to_bin:
+                
+            if nowneg:
+                if verbose and negy: print 'Converting xy to binary. Leaving ys negative.'
+                bi=N.array([ppygis.LineString([ppygis.Point(o[0],o[1]) for o in c]).write_ewkb() for c in geom])
+            if not nowneg: 
+                if verbose and negy: print 'Converting xy to binary. Converting ys to negative.'
+                bi=N.array([ppygis.LineString([ppygis.Point(o[0],-o[1]) for o in c]).write_ewkb() for c in geom])
+                
+            return bi
+        
+                
+                
+            
+            
+
+
+
+
+        
+
+          
+
+        
+        
+
+
+#finding input datatype
+    
 
 def angular_std(x,y):
 
@@ -496,7 +636,10 @@ a = TimeImage(imgpath)
 ##        a.saveimg(coloredgesby='random',outpath = "/Users/igswahwsmcevan/force/cannyeval_5rad/canny%s_%s.jpg" % (t1,t3))
 #
 #
-f = a.get_lines(asxy=True, negy=False)
+f = querydb("SELECT geometry from edges limit 3;")['geometry']
+#print re.search('|S',f[2].dtype)=geom_converter(f, to_ppy=True, to_xy=False,to_bin=False,negy=False)
+
+
 #colors = straight#a.edges.get_attribute('straightness1').astype(float)
 #mx = N.compress(~N.isnan(colors),colors).max()
 #colors = N.where(N.isnan(colors),mx,colors)
