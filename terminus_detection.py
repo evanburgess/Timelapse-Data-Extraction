@@ -1,5 +1,5 @@
 import psycopg2
-
+import subprocess as sub
 import xlrd
 import re
 import unicodedata
@@ -21,6 +21,8 @@ from scipy import ndimage
 from scipy import misc
 import scipy.stats as stats
 import cv2 as cv2
+import cProfile
+import shapefile as shp
 
 sys.path.append('/Users/igswahwsmcevan/Altimetry/code')
 #from .Interface import *
@@ -40,8 +42,7 @@ import matplotlib as mpl
 import matplotlib.cm as cm
 import random
 import pycircstat
-
-
+from joblib import Parallel, delayed
 def querydb(select,asdict=True,aslist=False,returnfields=False):
     
     if aslist==True:asdict=False
@@ -69,12 +70,12 @@ def querydb(select,asdict=True,aslist=False,returnfields=False):
     
     return out
     
-def alterdb(sql,conn=None,close=True):
+def alterdb(sql,conn=None,close=True,database = 'altimetry', host='localhost'):
 
     if conn:
         cur = conn.cursor()
     else:
-        conn = psycopg2.connect(database = 'altimetry', host='localhost')
+        conn = psycopg2.connect(database = database, host=host)
         cur = conn.cursor()
         
     #QUERYING DATABASE
@@ -105,19 +106,17 @@ def import_raster(filepath,dtmparse = '(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2
     os.system("/Applications/Postgres.app/Contents/Versions/9.3/bin/raster2pgsql -a -R -f image -Y %s public.timelapse | /Applications/Postgres.app/Contents/Versions/9.3/bin/psql -d altimetry" % filepath)
     
     #FINDING ID OF LAST ENTRY IN TABLE
-    cur.execute("SELECT photoid::int from timelapse order by photoid desc limit 1;")
-    photoid = querydb("SELECT photoid::int from timelapse order by photoid desc limit 1;")
-    
+    #cur.execute("SELECT photoid::int from timelapse order by photoid desc limit 1;")
+    photoid = querydb("SELECT photoid::int from timelapse order by photoid desc limit 1;",aslist=True)
+
     #UPDATING OTHER IMAGE METADATA
     alterdb("UPDATE timelapse SET (cameraid,locationid,date,path) = (%i,%i,'%s','%s') WHERE photoid=%i;" % (cameraid,locationid,re.sub('T',' ', date.isoformat()),filepath,photoid))
 
     
     #FINDING ID OF THIS IMAGE
-    out = querydb(("SELECT photoid::int from timelapse order by photoid desc limit 1;")
+    out = querydb("SELECT photoid::int from timelapse order by photoid desc limit 1;")
     
     return out
-    
-
     
 def import_timelapse_dir(folder, select = "*"):
   
@@ -129,20 +128,26 @@ def import_timelapse_dir(folder, select = "*"):
     
     for f in filepaths:
         out = import_raster(f)
+def copydata_fromcsv(*args,**kwargs):
+    
+    #datatypes = [querydb("SELECT data_type FROM information_schema.columns WHERE table_name='%s' AND column_name='%s';" % (kwargs['table'],c),aslist=True)[0] for c in kwargs['columns']]
 
-#class TLimageObject:
-#    def __init__(self, photoid=None,imgpath=None):
-#        
-#        # Connect to an existing spatially enabled database
-#        conn, cur = ConnectDb()
-#        
-#        
-#        if 'gid' in indata.keys():self.gid = indata['gid']
-#            if 'glid' in indata.keys():self.glid = indata['glid']
-  
-
-  
-              
+    data = zip(*args)
+    
+    copyformat = "%s\n" % ','.join(kwargs['format'])
+    buffer = StringIO.StringIO()
+    for line in data:buffer.write(copyformat % line)
+    buffer.seek(0)
+    
+    if 'connection' in kwargs.keys():
+        cur = kwargs['connection'].cursor()
+    else:
+        conn = psycopg2.connect(database = 'altimetry', host='localhost')
+        cur = conn.cursor()
+        
+    cur.copy_from(buffer, kwargs['table'], sep=',', null='\\N', columns=kwargs['columns']) 
+    conn.commit() 
+    buffer = None
                                                   
 class TimeImage:
     def __init__(self, thisphoto):
@@ -151,13 +156,14 @@ class TimeImage:
                 self.imagepath = thisphoto
                 self.photoid = querydb("SELECT photoid::int as photoid from timelapse where path = '%s';" % self.imagepath,aslist=True)[0]     #GetSqlData2("SELECT photoid::int as photoid from timelapse where path = '%s';" % self.imagepath)['photoid'][0]
         elif isinstance(thisphoto, (int, long, float)):
-            if GetSqlData2("SELECT EXISTS(SELECT 1 FROM timelapse WHERE photoid=%i)" % thisphoto):
+            if querydb("SELECT EXISTS(SELECT 1 FROM timelapse WHERE photoid=%i)" % thisphoto,aslist=True):
                 self.photoid  = thisphoto
-                self.imagepath = GetSqlData2("SELECT path FROM timelapse WHERE photoid = '%s';" % self.photoid)['path'][0]
+                #print 'here',"SELECT path FROM timelapse WHERE photoid = %s;" % self.photoid,querydb("SELECT path FROM timelapse WHERE photoid = %s;" % self.photoid)['path'][0]
+                self.imagepath = querydb("SELECT path FROM timelapse WHERE photoid = %s;" % self.photoid)['path'][0]
             else: raise "This photoid or path cannot be found"
         else:raise "Please provide a valid photoid OR image path"
         self.img = None
-        self.edges = Edges(where='photoid=%i' % self.photoid)
+        self.edges = None
         
     def get_image(self):
         if type(self.img)==NoneType:
@@ -165,165 +171,75 @@ class TimeImage:
             return self.img
         else:
             return self.img
+
     def Canny1(self, threshold1=0,threshold2=200,overwriteallphoto = True,overwriteparamrun = False,binarycutoff = 127,apertureSize=3):
 
         #CALCULATING EDGES
-        print threshold1,threshold2
         edges = cv2.Canny(self.get_image(),threshold1,threshold2,apertureSize=apertureSize)
         ret,thresh = cv2.threshold(edges,binarycutoff,255,0)  
         contours,hierarchy  = cv2.findContours(thresh,cv2.RETR_TREE,cv2.CHAIN_APPROX_SIMPLE) 
+
+
+        if len(contours)==0:raise "ERROR: No edges identified under current parameters."
         
-        #self.get_lines(asxy=True)
-        #self.get_image()
-        #cv2.drawContours(self.get_image(), contours, -1, (0,255,0), 2) 
-        #cv2.imwrite('/Users/igswahwsmcevan/Desktop/test2.jpg', self.get_image())
-
-        #print type(contours),type(contours[4]),contours[4].shape
-        #print type(contours),type(contours[1]),contours[1].shape
-        #print contours[4]
-        #PREPING THEM TO BE INSERTED AS A GEOMETRY
-        start_time = time.time()
-        lines=[ppygis.LineString([gis.Point(o[0][0],-o[0][1]) for o in c]) for c in contours]
-
+        #PREPING THEM TO BE INSERTED AS A GEOMETRY    
         #Prepare data for upload to database
         #parameters used for this run
         params = "Canny1 threshold1:%s threshold2:%s binarycutoff:%s " % (threshold1,threshold2,binarycutoff)
         now = re.sub('T',' ',dtm.datetime.now().isoformat())
 
         #CHECKING REQUESTS FOR OVERWRITES
-        #conn, cur = ConnectDb()
-        if overwriteallphoto:
-            alterdb("DELETE from edgeparameters WHERE photoid=%s;" % self.photoid)
-            #cur.execute("DELETE from edgeparameters WHERE photoid=%s;" % self.photoid)
-            #conn.commit()
-            
-        if overwriteparamrun:
-            alterdb("DELETE from edgeparameters WHERE photoid=%s AND params='%s';" % (self.photoid,params))
-            #cur.execute("DELETE from edgeparameters WHERE photoid=%s AND params='%s';" % (self.photoid,params))
-            #conn.commit()
-        
+        if overwriteallphoto:alterdb("DELETE from edgeparameters WHERE photoid=%s;" % self.photoid)
+
+        if overwriteparamrun:alterdb("DELETE from edgeparameters WHERE photoid=%s AND params='%s';" % (self.photoid,params))
+
         #INSERTING INTO EDGE PARAMETER TABLE
+        lines=[ppygis.LineString([gis.Point(o[0][0],-o[0][1]) for o in c]).write_ewkb() for c in contours]
+
         paramid = alterdb("INSERT INTO edgeparameters (photoid,params,rundate) VALUES (%i,'%s','%s') RETURNING paramid;" % (self.photoid,params,now))[0][0]
-        #cur.execute("INSERT INTO edgeparameters (photoid,params,rundate) VALUES (%i,'%s','%s') RETURNING paramid;" % (self.photoid,params,now))
-        #paramid = cur.fetchall()[0][0]
-        #print paramid2,paramid
+
+        start_time = time.time()
         
-        for h,l in zip(hierarchy[0],lines):
-            #INSERTING INTO EDGES TABLE 
-            alterdb("INSERT INTO edges (photoid,paramid,presamelvl,nextsamelvl,child,parent,geometry) VALUES (%i,%i,%i,%i,%i,%i,'%s');" % (self.photoid,paramid,h[0],h[1],h[2],h[3],l.write_ewkb()))
-            #cur.execute("INSERT INTO edges (photoid,paramid,presamelvl,nextsamelvl,child,parent,geometry) VALUES (%i,%i,%i,%i,%i,%i,'%s');" % (self.photoid,paramid,h[0],h[1],h[2],h[3],l.write_ewkb()))
-        #conn.commit()
-        #cur.close()
+        h1,h2,h3,h4 = zip(*hierarchy[0])
         
-        #############
+        copydata_fromcsv(N.zeros_like(h1)+self.photoid,N.zeros_like(h1)+paramid,h1,h2,h3,h4,lines,columns=['photoid','paramid','presamelvl','nextsamelvl','child','parent','geometry'],table='edges',format = ["%i","%i","%i","%i","%i","%i","%s"])
+
+        
+        #for h,l in zip(hierarchy[0],lines):
+            #alterdb("INSERT INTO edges (photoid,paramid,presamelvl,nextsamelvl,child,parent,geometry) VALUES (%i,%i,%i,%i,%i,%i,'%s');" % (N.zeros_like(self.photoid)+self.photoid,N.zeros_like(paramid)+paramid,h[0],h[1],h[2],h[3],l.write_ewkb()))
+        #print time.time()-start_time        
+
         #RETURN AN OBJECT that points to this data in the db AND MAKE THIS A METHOD OF A TIMELAPSE OBJECT
-        self.edges = Edges(where="photoid = %s" % self.photoid,presamelvl=hierarchy.T[0],nextsamelvl=hierarchy.T[1],child=hierarchy.T[2],parent=hierarchy.T[3],lines=lines,paramid=paramid)
+        self.edges = Edges(where="photoid = %s" % self.photoid,presamelvl=hierarchy.T[0],nextsamelvl=hierarchy.T[1],child=hierarchy.T[2],parent=hierarchy.T[3],geometry=lines,paramid=paramid)
 
         return self.edges  
-        
-    def get_lines(self, getfields = None, modify_geometry = None, where=None,asxy=False, negy = True, simplified=None):
-        
-              #THIS METHOD WILL SELECT THE APPROPRIATE EDGES FROM THE DATABASE, UNLESS THEY ARE ALREADY LOADED INTO MEMORY
-              #IN WHICH CASE IT JUST RETURNS THE EDGES FROM MEMORY.  YOU CAN ALSO SPECIFY A SPECIFIC WHERE FOR A QUERY      
-        if type(where)==NoneType and not type(self.edges.lines)==NoneType:
-            if asxy:
-                if negy: 
-                    return [N.array([[pt.x,pt.y] for pt in ls.points]) for ls in self.edges.lines]
-                else:
-                    return [N.array([[pt.x,-pt.y] for pt in ls.points]) for ls in self.edges.lines]
-            else:
-                return self.edges
-
-        if type(where) == NoneType:
-            toggle = True
-            where='WHERE photoid = %i' % self.photoid
-        else: 
-            if not re.search('^\s*WHERE',where):
-                where = "WHERE %s" % where
-
-            if not re.search('photoid\s*=\s*%i' % self.photoid,where):
-                if re.search('photoid\s*=',where):raise "ERROR: here you can only query edges from this photo"
-                where= "%s AND photoid=%i" % (where,self.photoid)
-
-            toggle = False
-            
-        #start_time = time.time()
-        conn = psycopg2.connect(database = 'altimetry', host='localhost')
-        cur = conn.cursor()
-        
-        if type(getfields)==NoneType:fields = 'geometry'
-        else: 
-            if modify_geometry:
-                geom = modify_geometry
-            else: 
-                geom = 'geometry'
-            fields = "%s ,%s" % (getfields,modify_geometry)
-  
-        #QUERYING DATABASE
-        #print "SELECT %s FROM edges %s;" % (fields,where)
-        cur.execute("SELECT %s FROM edges %s;" % (fields,where))
-        #out,fields = querydb("SELECT %s FROM edges %s;" % (fields,where),returnfields=True)
-        #getting fields 
-        fields = [column[0] for column in cur.description]
-        
-        #print fields
-        
-        #this takes the database output puts it in columns then into a dictionary with field names as keys
-        out = dict(zip(fields,zip(*cur.fetchall())))
-        cur.close()
-        
-
-        out['lines'] = [ppygis.Geometry.read_ewkb(row) for row in out['geometry']]
-        out.pop('geometry')
-        out['where']=where
-        
-        #option to output the coordinates just as an xy list not as ppygis objects
-        if asxy: 
-            if negy:
-                return [N.array([[pt.x,pt.y] for pt in ls.points]) for ls in out['lines']]
-            else:
-                return [N.array([[pt.x,-pt.y] for pt in ls.points]) for ls in out['lines']]
-        
-        out2=[]
-        for key in out.keys():
-            if key not in dir(self):
-                out2.append(out[key])  
-                out.pop(key)
-                  
-        if toggle and not asxy and not modify_geometry:
-            self.edges = Edges(**out)
-            if len(out2)==0:
-                return self.edges
-            else: 
-                return self.edges,out2
-        else:
-            if len(out2)==0:
-                return Edges(**out)
-            else: 
-                return Edges(**out),out2
-
          
-    def saveimg(self, outpath = None, showedges = True,setlims=None,coloredgesby=None,colorlimits = None, uselines=None):
+    def showimg(self, outpath = None, showedges = True,setlims=None,coloredgesby=None,colorlimits = None, uselines=None,showlines=None):
         import matplotlib.collections as col
         
         fig = plt.figure(figsize=[self.get_image().shape[1]/300.,self.get_image().shape[0]/300.],dpi = 300)
         ax = fig.add_axes([0,0,1,1],frameon=False)
         ax.imshow(self.get_image()[:,:,::-1])
         
-        if showedges:
-            if type(coloredgesby)!=NoneType:
+        if showedges and type(self.edges)!=NoneType:
+
+            if type(coloredgesby)==NoneType:
+                colors='r'
+            else:
                 
                 if type(coloredgesby) == str:
                     if coloredgesby == 'random':
                         colorby = N.random.rand(len(a.get_lines().lines))
                 else:
-                    colorby = coloredgesby
+                    mx = coloredgesby.max()
+                    colorby = N.where(N.isnan(coloredgesby.astype(float)),mx,coloredgesby)
 
         
                 if colorlimits:
                     norm = mpl.colors.Normalize(vmin=colorlimits[0], vmax=colorlimits[1])
                 else:
                     norm = mpl.colors.Normalize(vmin=colorby.min(), vmax=colorby.max())
+                print colorby.min(),colorby.max()
                 cmap = cm.hot
         
                 
@@ -331,13 +247,21 @@ class TimeImage:
                 colors=m.to_rgba(colorby)  
         
             if not uselines:
-                self.get_lines()
-                ln_coll = col.LineCollection(self.get_lines(asxy=True, negy=False),lw=0.3,color=colors)
+                inlines = self.edges.get_lines(format='xy',ys='pos')
+                if type(showlines)!=NoneType:
+                    w=N.where(showlines)[0]
+                    inlines = N.array(inlines)[w]
+                    colors = colors[w]
+                    
+                ln_coll = col.LineCollection(inlines,lw=0.3,color=colors)
             else:
-                if type(e.lines[0])==ppygis.LineString:
-                    ln_coll = col.LineCollection(ppy2xy(uselines, inverty=True),lw=0.3,color=colors)
-                else:
-                    ln_coll = col.LineCollection(uselines,lw=0.3,color=colors)
+                if type(showlines)!=NoneType:
+                    w=N.where(showlines)[0]
+                    inlines = N.array(uselines)[w]
+                    colors = colors[w]
+                else:inlines=uselines
+                    
+                ln_coll = col.LineCollection(geom_converter(inlines,to_xy=True,negy=True),lw=0.3,color=colors)
             ax.add_collection(ln_coll)
             
 
@@ -353,14 +277,18 @@ class TimeImage:
         else:
             plt.show()
             
+    def add_edges(self,getfields=None):
+        if type(self.edges)==NoneType:
+            self.edges = Edges(photoid=self.photoid,where="photoid = %s" % self.photoid)
+            succeed = self.edges.retrieve_fields(getfields)
+            if type(succeed)==NoneType:self.edges=None
 
-
-
+            
 class Edges:
-    def __init__(self,where = None,lines = None,edgeid=None,photoid =None,presamelvl=None,nextsamelvl=None,child=None,parent=None,selected=None,front=None,paramid=None):
+    def __init__(self,where = None,geometry = None,edgeid=None,photoid =None,presamelvl=None,nextsamelvl=None,child=None,parent=None,selected=None,front=None,paramid=None):
 
         self.where = where
-        self.lines = lines
+        self.geometry = geometry
         self.edgeid=edgeid
         self.photoid =photoid
         self.presamelvl=presamelvl
@@ -372,9 +300,8 @@ class Edges:
         self.paramid=paramid
         self.straightness1=None
         
-
-        
     def retrieve_fields(self,getfields):
+        #print getfields
         if type(getfields)==str:fields = re.split('\s*,?\s*',getfields)
         elif type(getfields)==list:fields=getfields
         elif type(getfields)==NoneType:fields = 'geometry'
@@ -383,25 +310,23 @@ class Edges:
         if self.where==None:raise "EdgeObject needs a where attribute to run get_fields"
         
         #print 'where',self.where
-        for i,field in enumerate(fields):
-            if field == 'edgeid':fields[i]='edgeid::int as edgeid'
-            if field == 'geometry':field='lines'
+        #for i,field in enumerate(fields):
+        #    #if field == 'edgeid':fields[i]='edgeid::int as edgeid'
+        #    #if field == 'geometry':field='lines'
         
-        #print ','.join(fields)
-        if not re.search('^\s*WHERE',self.where):where = "WHERE %s" % self.where
-        else:where=self.where
+        if not re.search('^\s*WHERE',self.where):
+            where = "WHERE %s" % self.where
+        else:
+            where=self.where
         
         #QUERYING DATABASE
-        #print "SELECT %s FROM edges %s ORDER BY edgeid;" % (','.join(fields),where)
-        cur.execute("SELECT %s FROM edges %s ORDER BY edgeid;" % (','.join(fields),where))
-         
-        if 'geometry' in out.keys():
-            out['lines'] = [ppygis.Geometry.read_ewkb(row) for row in out['geometry']]
-            out.pop('geometry')
+        if type(fields)==list:fields = ','.join(fields)
+        #print "SELECT %s FROM edges %s ORDER BY edgeid;" % (fields,where)
+        out = querydb("SELECT %s FROM edges %s ORDER BY edgeid;" % (fields,where))
         
-
+        if len(out.keys())==0:return
         for key in out.keys():setattr(self,key,out[key])
-        
+
         if len(out.keys())>1:return out
         else:return out[key]
         
@@ -409,44 +334,97 @@ class Edges:
     def get_attribute(self,attribute):
         if type(getattr(self,attribute))==NoneType:return self.retrieve_fields(attribute)
         else:return getattr(self,attribute)
-                            
+        
+    def get_lines(self,format=None,ys=None,updateattribute=False):
+        #format can be 'xy','ppy',or 'bin'  #ys can be 'neg' or 'pos'  
+        
+        if type(getattr(self,'geometry'))==NoneType:self.retrieve_fields('geometry')
+
+        if format!=None or ys!=None:
+
+            if format==None:raise "ERROR: if you specify format or ys, you must specify both."
+            formatbool = N.array(['xy','ppy','bin'])==format
+            if ys=='neg':negbool = True
+            elif ys=='pos':negbool=False
+            else: raise "ERROR: ys must be either 'neg' or 'pos'"
+            
+            if updateattribute: self.geometry = geom_converter(self.geometry, to_xy=formatbool[0],to_ppy=formatbool[1], to_bin=formatbool[2],negy=negbool,verbose=False) 
+            
+            return geom_converter(self.geometry, to_xy=formatbool[0],to_ppy=formatbool[1], to_bin=formatbool[2],negy=negbool,verbose=False) 
+            
+        else: return self.geometry
+        
+    def update_db(self,*args,**kwargs):
+        
+        if type(kwargs['columns'])!=list:cols = [kwargs['columns']]
+        else: cols = kwargs['columns'][:]
+        
+        columns = ','.join(["%s = c.col%i" % (c,i) for c,i in zip(cols,N.arange(len(cols)))])
+        columns = re.sub("True",'t',columns)
+        columns = re.sub("False",'f',columns)
+        
+        if type(self.edgeid)==NoneType:self.get_attribute('edgeid')
+        
+        args2 = list(args)
+        args2.append(self.edgeid)
+        values = str(zip(*args2))[1:-1]
+        values = re.sub("None|nan","NULL",values)
+
+        alterdb("UPDATE edges as t SET \n%s\nFROM (values\n%s\n) AS c(%s)\nWHERE c.col%i=t.edgeid;" % (columns,values,','.join(["col%i" % j for j in N.arange(len(cols)+1)]),i+1))
+                                
     def measure_straightness(self,updatefield=None,use_regression=False,use_anglestd=True):
 
         if use_regression==use_anglestd:raise "ERROR: Please pick either anglestd or regression method"
-        if type(self.lines)==NoneType:
+        if type(self.geometry)==NoneType:
             #print 'here'
             self.retrieve_fields('geometry')
         if type(self.edgeid)==NoneType:self.retrieve_fields('edgeid')
         
-        xs = [N.array([pt.x for pt in ls.points]) for ls in self.lines]
-        ys = [N.array([pt.y for pt in ls.points]) for ls in self.lines]
-
+        #xys = self.get_lines(format='xy',ys='neg')
+        xys = geom_converter(self.retrieve_fields("ST_SimplifyPreserveTopology(geometry,3)"),to_xy=True,negy=True)
+        xs=[xy[:,0] for xy in xys]
+        ys=[xy[:,1] for xy in xys]
         r2 = []
-
-        for x,y in zip(xs,ys):
+        
+        length = self.retrieve_fields("ST_Length(geometry)")
+        
+        #print length
+        
+        for x,y,l in zip(xs,ys,length):
 
             if use_regression:
                 r2.append(stats.linregress(x, y)[2]**2)
             elif use_anglestd:
-                r2.append(angular_std(x,y))
+                r2.append(angular_std(x,y)/l)
         
         if type(updatefield)!=NoneType:
+            self.update_db(r2,columns=updatefield)
+        
+        self.straightness1 = r2
             
-            conn = psycopg2.connect(database = 'altimetry', host='localhost')
-            cur = conn.cursor()
+            #for r,eid in zip(r2,self.edgeid):
+            #    if N.isnan(r):continue
+            #    alterdb("UPDATE edges SET %s = %4.3f WHERE edgeid = %i;" % (updatefield,r,eid))
 
-            for r,eid in zip(r2,self.edgeid):
-                if N.isnan(r):continue
-                cur.execute("UPDATE edges SET %s = %4.3f WHERE edgeid = %i;" % (updatefield,r,eid))
-                #print r
-            conn.commit()
-            cur.close()
         return N.array(r2)
         
-def ppy2xy(inpt, inverty=False):
-    if inverty:return [N.array([[pt.x,-pt.y] for pt in ls.points]) for ls in inpt]
-    else:return [N.array([[pt.x,pt.y] for pt in ls.points]) for ls in inpt]
-    
+    #def add_front(self, shapefile):
+    #        
+    #    sf = shp.Reader(shapefile)
+    #        
+    #    
+    #    #HANDLING MULTIPLE POLYGONS...CAN'T DO THAT YET
+    #    shapes = sf.shapes()
+    #    if len(shapes)>1:raise "ERROR: Shapefile has more than one geometry"
+    #    
+    #    #print N.array([shapes[0].points])
+    #    geom = geom_converter(N.array([shapes[0].points]), to_bin=True,negy=True,verbose=False)
+    #    copydata_fromcsv(geom,['t'],[self.photoid], columns=['geometry','front','photoid'],table='edges',format = ["%s","%s","%i"]) 
+        
+    def get_front(self):
+        if type(self.front)==NoneType:
+            self.retrieve_attribute("")
+                 
 def geom_converter(geom, to_ppy=False, to_xy=False,to_bin=False,negy=True,verbose=True):
     if sum([to_ppy,to_xy,to_bin])!=1:raise "ERROR: please select one output format"
     
@@ -522,7 +500,7 @@ def geom_converter(geom, to_ppy=False, to_xy=False,to_bin=False,negy=True,verbos
                         return [N.array([[pt.x,pt.y] for pt in ls.points]) for ls in geom] 
                         
     #TESTING TO SEE IF INPUT GEOMETRY IS XY                     
-    if geom[0][0][0].dtype==float:  #  INPUT IS A xy GEOMETRY
+    if N.array(geom[0][0][0]).dtype==float:  #  INPUT IS A xy GEOMETRY
         
         if geom[0][0,1]<0:
             nowneg = True
@@ -567,25 +545,6 @@ def geom_converter(geom, to_ppy=False, to_xy=False,to_bin=False,negy=True,verbos
                 bi=N.array([ppygis.LineString([ppygis.Point(o[0],-o[1]) for o in c]).write_ewkb() for c in geom])
                 
             return bi
-        
-                
-                
-            
-            
-
-
-
-
-        
-
-          
-
-        
-        
-
-
-#finding input datatype
-    
 
 def angular_std(x,y):
 
@@ -594,8 +553,13 @@ def angular_std(x,y):
     
     rise = (y[1:]-y[:-1])
     rn = (x[1:]-x[:-1])
+        
+    # HERE REMOVING LINES IF THEY ARE THE SAME LINE BUT IN OPPOSITE DIRECTIONS.  NOW LINES GOING BACKWARDS ARE FLIPPED FORWARDS
+    rise = N.where(rn<0,-rise,rise)  
+    rn = N.abs(rn)
     
     angles = N.arctan2(rise,rn)
+    #print angles*180/math.pi
     
     return pycircstat.astd(angles)
     
@@ -607,9 +571,41 @@ overwriteallphoto = True
 overwriteparamrun = False
 binarycutoff = 127
 
-thisphoto = 3
 
-a = TimeImage(imgpath)
+
+
+##sf = shp.Reader("/Users/igswahwsmcevan/Desktop/Untitled.shp")
+#    
+#
+##HANDLING MULTIPLE POLYGONS...CAN'T DO THAT YET
+#shapes = sf.shapes()
+#nshapes = len(shapes)
+#print 'nshapes', nshapes
+
+
+
+thisphoto = 3
+#import_timelapse_dir("/Users/igswahwsmcevan/force/timelapse/")
+a = TimeImage(22)
+
+#a.showimg()
+#start_time = time.time()
+
+#a.Canny1(threshold1=1100,threshold2=1300,apertureSize=5)
+#print start_time - time.time()
+a.add_edges()
+#a.edges.add_front("/Users/igswahwsmcevan/Desktop/Untitled.shp")
+#a.edges.measure_straightness(updatefield='straightness1',use_regression=True,use_anglestd=False)
+#print a.edges.get_lines(format='xy',ys='neg')
+#geometry=a.edges.retrieve_fields("ST_SimplifyPreserveTopology(geometry,3)")
+
+
+a.showimg(coloredgesby=a.edges.retrieve_fields('straightness1'),colorlimits = [0.5,1])
+#a.edges.get_attribute('straightness1')
+#a.edges.get_attribute('edgeid')
+#a.edges.update_db(a.edges.straightness1,columns=['straightness1'])
+#b = copydata_fromcsv([1,2,3,4,5],[6,7,8,9,0],[6,7,8,9,0],columns=['geometry','front','selected'],table='edges',format = ["'%s'","'%s'","%s"])
+
 #e,length = a.get_lines(modify_geometry="ST_Simplify(geometry,1) as geometry",getfields="ST_Length(geometry)::real as length")
 
 
@@ -631,7 +627,7 @@ a = TimeImage(imgpath)
 ##        a.saveimg(coloredgesby='random',outpath = "/Users/igswahwsmcevan/force/cannyeval_5rad/canny%s_%s.jpg" % (t1,t3))
 #
 #
-f = querydb("SELECT geometry from edges limit 3;")['geometry']
+#f = querydb("SELECT geometry from edges limit 3;")['geometry']
 #print re.search('|S',f[2].dtype)=geom_converter(f, to_ppy=True, to_xy=False,to_bin=False,negy=False)
 
 
@@ -640,7 +636,7 @@ f = querydb("SELECT geometry from edges limit 3;")['geometry']
 #colors = N.where(N.isnan(colors),mx,colors)
 #
 #e.lines
-#a.saveimg(coloredgesby=colors,colorlimits=[1.,1.5],uselines=e.lines)#setlims=[1600,1800,800,800])  
+#a.saveimg(coloredgesby=colors,colorlimits=[1.,1.5],uselines=e.geometry)#setlims=[1600,1800,800,800])  
 
 #x,y = a.get_lines(asxy=True)[4].T
 
