@@ -41,6 +41,7 @@ import ppygis
 import matplotlib as mpl
 import matplotlib.cm as cm
 import random
+from scipy.interpolate import griddata
 import pycircstat
 from joblib import Parallel, delayed
 def querydb(select,asdict=True,aslist=False,returnfields=False):
@@ -300,24 +301,30 @@ class Edges:
         self.paramid=paramid
         self.straightness1=None
         
-    def retrieve_fields(self,getfields):
+    def retrieve_fields(self,getfields,where = None):
         #print getfields
         if type(getfields)==str:fields = re.split('\s*,?\s*',getfields)
         elif type(getfields)==list:fields=getfields
         elif type(getfields)==NoneType:fields = 'geometry'
         else:raise 
         
-        if self.where==None:raise "EdgeObject needs a where attribute to run get_fields"
+        if self.where==None and where==None:raise "EdgeObject needs a where attribute to run get_fields or specify where parameter"
         
         #print 'where',self.where
         #for i,field in enumerate(fields):
         #    #if field == 'edgeid':fields[i]='edgeid::int as edgeid'
         #    #if field == 'geometry':field='lines'
         
-        if not re.search('^\s*WHERE',self.where):
-            where = "WHERE %s" % self.where
+        if where==None:
+            ret = True
+            where = self.where
         else:
-            where=self.where
+            ret=False
+
+        if not re.search('^\s*WHERE',where):
+            where = "WHERE %s" % where
+        else:
+            where=where
         
         #QUERYING DATABASE
         if type(fields)==list:fields = ','.join(fields)
@@ -325,13 +332,14 @@ class Edges:
         out = querydb("SELECT %s FROM edges %s ORDER BY edgeid;" % (fields,where))
         
         if len(out.keys())==0:return
-        for key in out.keys():setattr(self,key,out[key])
-
+        if ret:
+            for key in out.keys():setattr(self,key,out[key])
+        
         if len(out.keys())>1:return out
-        else:return out[key]
+        else:return out[out.keys()[0]]
         
         
-    def get_attribute(self,attribute):
+    def get_field(self,attribute):
         if type(getattr(self,attribute))==NoneType:return self.retrieve_fields(attribute)
         else:return getattr(self,attribute)
         
@@ -363,7 +371,7 @@ class Edges:
         columns = re.sub("True",'t',columns)
         columns = re.sub("False",'f',columns)
         
-        if type(self.edgeid)==NoneType:self.get_attribute('edgeid')
+        if type(self.edgeid)==NoneType:self.get_field('edgeid')
         
         args2 = list(args)
         args2.append(self.edgeid)
@@ -420,10 +428,10 @@ class Edges:
     #    #print N.array([shapes[0].points])
     #    geom = geom_converter(N.array([shapes[0].points]), to_bin=True,negy=True,verbose=False)
     #    copydata_fromcsv(geom,['t'],[self.photoid], columns=['geometry','front','photoid'],table='edges',format = ["%s","%s","%i"]) 
-        
-    def get_front(self):
-        if type(self.front)==NoneType:
-            self.retrieve_attribute("")
+    #    
+    #def get_front(self):
+    #    if type(self.front)==NoneType:
+    #        self.retrieve_attribute("")
                  
 def geom_converter(geom, to_ppy=False, to_xy=False,to_bin=False,negy=True,verbose=True):
     if sum([to_ppy,to_xy,to_bin])!=1:raise "ERROR: please select one output format"
@@ -588,21 +596,111 @@ thisphoto = 3
 #import_timelapse_dir("/Users/igswahwsmcevan/force/timelapse/")
 a = TimeImage(22)
 
+
+img = a.get_image()
+a.add_edges()
+front = geom_converter(a.edges.retrieve_fields('geometry',where = "front = 't'"),to_xy=True,negy=False)
+
+x = front[0][:,0]
+y = -front[0][:,1]
+
+rise = (y[1:]-y[:-1])
+rn = (x[1:]-x[:-1])
+rn = N.where(rn==0,0.001,rn)
+
+fronttheta = N.arctan(rise/rn)
+
+opp = N.sin(fronttheta)
+adj = N.cos(fronttheta)
+
+#grid_x, grid_y = N.mgrid[0:img.shape[0], 0:img.shape[1]]
+
+oppgrid = N.empty([img.shape[0],img.shape[1]])
+adjgrid = N.empty([img.shape[0],img.shape[1]])
+ones = N.empty([img.shape[0],img.shape[1]])
+
+oppgrid[[-y[1:].astype(int)],[x[1:].astype(int)]] = opp
+adjgrid[[-y[1:].astype(int)],[x[1:].astype(int)]] = adj
+ones[[-y[1:].astype(int)],[x[1:].astype(int)]] = N.ones_like(adj)
+
+#grid = griddata(N.c_[-y[1:],x[1:]], opp, (grid_x, grid_y), method='cubic', fill_value=nan, rescale=False)
+#onesgrid = scipy.ndimage.filters.gaussian_filter(ones, sigma=100, mode='nearest')
+#adjgrid = scipy.ndimage.filters.gaussian_filter(adjgrid, sigma=100, mode='nearest')
+#oppgrid = scipy.ndimage.filters.gaussian_filter(oppgrid, sigma=100, mode='nearest')
+oppgrid2 = scipy.ndimage.filters.uniform_filter(oppgrid, size=250, mode='nearest')
+adjgrid2 = scipy.ndimage.filters.uniform_filter(adjgrid, size=250, mode='nearest')
+
+
+anglegrid = N.arctan(oppgrid2/adjgrid2)*180/math.pi
+
+#fig = plt.figure()
+#
+#ax = fig.add_subplot(121)
+#ax1 = fig.add_subplot(122)
+
+plt.imshow(img)
+#ax1.imshow(anglegrid)
+plt.plot(x,-y,'-')
+#ax1.plot(x,-y,'-')
+#ax.scatter(x[1:],-y[1:],c=opp,s=45)
+plt.colorbar()
+plt.show()
+
+raise
+
+
+
+sobx = cv2.Sobel(img[:,:,0],cv2.CV_64F,1,0,ksize=5)
+soby = cv2.Sobel(img[:,:,0],cv2.CV_64F,0,1,ksize=5)
+
+theta = N.arctan(soby/sobx)
+grad = N.sqrt(soby**2+sobx**2)
+
+theta = N.where(N.isnan(theta),0,theta)
+
+
+
+#def angle_filter(angle):
+    
+
+def gaussian(x, mu, sig):
+    return N.exp(-N.power(x - mu, 2.) / (2 * N.power(sig, 2.)))
+    
+def gaussian_circ(x, mu, sig):
+    return (gaussian(x, mu, sig)+gaussian(x, mu+math.pi, sig)+gaussian(x, mu-math.pi, sig))/3.
+    
+dir_filter = gaussian_circ(theta,1.2,-math.pi/8)
+
+edge = dir_filter * grad
+fig = plt.figure()
+ax = fig.add_subplot(111)
+ax.imshow()
+ax.plot()
+ax.plot(front[0][:,0],front[0][:,1],'r')
+#ax2 = fig.add_subplot(111)
+#ax2.imshow(dir_filter)
+#ax.plot(N.arange(-math.pi/2,math.pi/2,0.01),gaussian_circ(N.arange(-math.pi/2,math.pi/2,0.01),math.pi/2.5,-math.pi/10))
+#plt.colorbar()
+plt.show()
+
+
+
+
 #a.showimg()
 #start_time = time.time()
 
 #a.Canny1(threshold1=1100,threshold2=1300,apertureSize=5)
 #print start_time - time.time()
-a.add_edges()
+#a.add_edges()
 #a.edges.add_front("/Users/igswahwsmcevan/Desktop/Untitled.shp")
 #a.edges.measure_straightness(updatefield='straightness1',use_regression=True,use_anglestd=False)
 #print a.edges.get_lines(format='xy',ys='neg')
 #geometry=a.edges.retrieve_fields("ST_SimplifyPreserveTopology(geometry,3)")
 
 
-a.showimg(coloredgesby=a.edges.retrieve_fields('straightness1'),colorlimits = [0.5,1])
-#a.edges.get_attribute('straightness1')
-#a.edges.get_attribute('edgeid')
+#a.showimg(coloredgesby=a.edges.retrieve_fields('straightness1'),colorlimits = [0.5,1])
+#a.edges.get_field('straightness1')
+#a.edges.get_field('edgeid')
 #a.edges.update_db(a.edges.straightness1,columns=['straightness1'])
 #b = copydata_fromcsv([1,2,3,4,5],[6,7,8,9,0],[6,7,8,9,0],columns=['geometry','front','selected'],table='edges',format = ["'%s'","'%s'","%s"])
 
@@ -631,7 +729,7 @@ a.showimg(coloredgesby=a.edges.retrieve_fields('straightness1'),colorlimits = [0
 #print re.search('|S',f[2].dtype)=geom_converter(f, to_ppy=True, to_xy=False,to_bin=False,negy=False)
 
 
-#colors = straight#a.edges.get_attribute('straightness1').astype(float)
+#colors = straight#a.edges.get_field('straightness1').astype(float)
 #mx = N.compress(~N.isnan(colors),colors).max()
 #colors = N.where(N.isnan(colors),mx,colors)
 #
